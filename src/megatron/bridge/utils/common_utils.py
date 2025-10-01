@@ -30,7 +30,8 @@ from megatron.bridge.utils.slurm_utils import (
     resolve_slurm_rank,
     resolve_slurm_world_size,
 )
-
+import logging
+logger = logging.getLogger(__file__)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -176,7 +177,8 @@ def print_rank_0(message: str) -> None:
     """
     rank = get_rank_safe()
     if rank == 0:
-        print(message, flush=True)
+        # print(message, flush=True)
+        logger.info(message)
 
 
 def warn_rank_0(message):
@@ -203,9 +205,10 @@ def print_rank_last(message: str) -> None:
     """
     if torch.distributed.is_initialized():
         if is_last_rank():
-            print(message, flush=True)
+            # print(message, flush=True)
+            logger.info(message)
     else:
-        print(message, flush=True)
+        logger.info(message)
 
 
 def hook_hf_module_setattr_for_tp_grad_sync(module: torch.nn.Module) -> torch.nn.Module:

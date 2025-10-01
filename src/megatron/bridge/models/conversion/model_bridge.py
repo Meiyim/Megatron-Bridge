@@ -946,14 +946,18 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                             f"WARNING: Shape mismatch for megatron param {task.mapping.megatron_param} allowed by whitelist. Skipping."
                         )
                         continue
-
-                    raise ValueError(
-                        f"Shape mismatch for megatron param {task.mapping.megatron_param}:\n"
-                        f"  Expected shape: {task.param_weight.shape}\n"
-                        f"  Got shape: {converted_weights.shape}\n"
-                        f"  Bridge type: {type(task.mapping).__name__}\n"
-                        f"  HF mapping: {task.mapping.hf_param}"
-                    )
+                    # try to auto reshape
+                    if converted_weights.numel() == task.param_weight.numel():
+                        converted_weights = converted_weights.reshape(task.param_weight.shape)
+                        print(f"Auto reshape for {task.mapping.megatron_param} from {converted_weights.shape} to {task.param_weight.shape}")
+                    else:
+                        raise ValueError(
+                            f"Shape mismatch for megatron param {task.mapping.megatron_param}:\n"
+                            f"  Expected shape: {task.param_weight.shape}\n"
+                            f"  Got shape: {converted_weights.shape}\n"
+                            f"  Bridge type: {type(task.mapping).__name__}\n"
+                            f"  HF mapping: {task.mapping.hf_param}"
+                        )
                 if capture_unquantized_state_dict:
                     vp_stage = task.vp_stage if task.vp_stage is not None else 0
                     chunk_key = f"model{vp_stage}"
@@ -1399,6 +1403,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
             raise ValueError("hf_pretrained.state.source is required for weight ordering")
 
         hf_keys: Optional[Iterable[str]] = hf_pretrained.state.source.get_all_keys() if has_hf_state else None
+        print(f"HF_KEYS-----{hf_keys}")
 
         mapping_registry = self.mapping_registry()
         unwrapped_model = unwrap_model(megatron_model)[0]
@@ -1406,7 +1411,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         embeddings_are_tied = self._share_embeddings_and_output_weights(model_config)
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         sorted_global_param_names_all_pp_ranks = self._megatron_global_param_names_all_pp_ranks(megatron_model)
-
+        print(f"MEGATRAON_KEYS-----{sorted_global_param_names_all_pp_ranks}")
         # Filter out output_layer related parameters if embeddings are tied
         if embeddings_are_tied:
             sorted_global_param_names_all_pp_ranks = [
