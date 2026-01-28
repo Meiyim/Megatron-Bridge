@@ -61,8 +61,14 @@ class Qwen2_5_VLVisualInputs:
     # Image tensors, e.g., Qwen2.5-VL processor output.
     pixel_values: Optional[torch.Tensor] = None
 
-    # Per-image temporal/spatial grid metadata (T, H, W) for videos, Qwen2.5-VL.
+    # Per-image temporal/spatial grid metadata (T, H, W) for images, Qwen2.5-VL.
     image_grid_thw: Optional[torch.Tensor] = None
+
+    # Video tensors, e.g., Qwen2.5-VL processor output.
+    pixel_values_videos: Optional[torch.Tensor] = None
+
+    # Per-video temporal/spatial grid metadata (T, H, W) for videos, Qwen2.5-VL.
+    video_grid_thw: Optional[torch.Tensor] = None
 
     def as_model_kwargs(self) -> dict[str, torch.Tensor]:
         """Return a mapping of non-None fields suitable for model forward kwargs."""
