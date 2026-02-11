@@ -53,6 +53,13 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     vision_dp_when_cp: bool = False
     use_hf_vision_model: bool = False
 
+    # Recompute skip layers: skip the first N layers (e.g., DeepStack layers) from recomputation
+    # When set to 3, layers 0,1,2 will NOT be recomputed, layers 3+ will be recomputed
+    recompute_skip_num_layers: int = 0
+
+    # Vision model attention implementation: "sdpa" (default), "flash_attention_2", or "eager"
+    vision_attn_implementation: str = "sdpa"
+
 
 def get_vision_model_config(hf_config, megatron_config=None):
     """
