@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 import logging
 from functools import partial
 from typing import Any, Iterable
@@ -66,7 +67,10 @@ def get_batch_from_iterator(
 
     # Instead of raw tensors, expect a single 'visual_inputs' object in batch
     required_device_keys.add("visual_inputs")
-
+    if 'timestamp' in batch:
+        required_host_keys.add('timestamp')
+        required_host_keys.add('timestamp_final')
+        
     if "cu_seqlens" in batch:
         required_device_keys.add("cu_seqlens")
         required_host_keys.add("cu_seqlens_argmin")
@@ -98,7 +102,7 @@ def get_batch_from_iterator(
 
 
 def get_batch(
-    data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = False, *, pg_collection
+    data_iterator: Iterable, state, use_mtp: bool = False, *, pg_collection
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -121,6 +125,7 @@ def get_batch(
         tuple of tensors containing tokens, labels, loss_mask, attention_mask, position_ids,
         cu_seqlens, cu_seqlens_argmin, max_seqlen, visual_inputs (container of optional modalities)
     """
+    cfg = state.cfg
     is_first = is_pp_first_stage(pg_collection.pp)
     is_last = is_pp_last_stage(pg_collection.pp)
 
@@ -133,6 +138,13 @@ def get_batch(
         is_first_pp_stage=is_first,
         is_last_pp_stage=is_last,
     )
+    if 'timestamp' in batch:
+        data_wait_timecost = time.time() - batch['timestamp_final'].item()
+        data_process_timecost =  batch['timestamp_final'].item() - batch['timestamp'].min().item()
+        if state.tensorboard_logger:
+            state.tensorboard_logger.add_scalar('data_timer/wait_data', data_wait_timecost, state.train_state.step)
+            state.tensorboard_logger.add_scalar('data_timer/process_data', data_process_timecost, state.train_state.step)
+        logger.info(f'data_wait_timecost:{data_wait_timecost:.3f} s, data_process_timecost:{data_process_timecost:.3f} s')
 
     # Slice only text tensors for context parallelism
     cp_keys = ("tokens", "input_ids", "labels", "loss_mask", "attention_mask", "position_ids")
@@ -238,7 +250,7 @@ def forward_step(
             cu_seqlens_argmin,
             max_seqlen,
             visual_inputs,
-        ) = get_batch(data_iterator, state.cfg, use_mtp, pg_collection=get_pg_collection(model))
+        ) = get_batch(data_iterator, state, use_mtp, pg_collection=get_pg_collection(model))
     timers("batch-generator").stop()
 
     forward_args = {
