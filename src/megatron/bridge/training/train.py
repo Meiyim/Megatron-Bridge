@@ -451,6 +451,7 @@ def train(
             history_wct,
             model,
             log_max_attention_logit,
+            num_total_tokens_in_batch,
         )
 
         if (
