@@ -55,25 +55,55 @@ def _merge_metric_chunks(
     metric_chunks: list[dict[str, torch.Tensor]],
     group: torch.distributed.ProcessGroup | None,
 ) -> dict[str, torch.Tensor]:
-    """Reduce metric chunks by key union."""
-    reduced: dict[str, torch.Tensor] = {}
-    all_keys = set().union(*(chunk.keys() for chunk in metric_chunks))
-    for key in all_keys:
+    """Reduce metric chunks by key union.
+
+    The key set is agreed ACROSS all ranks in ``group`` first (via all_gather_object),
+    then every rank all_reduces the SAME keys in the SAME order — a rank missing a key
+    contributes a correctly-shaped zero tensor. Without this cross-rank agreement, ranks
+    whose local micro-batches carry different per-dataset keys (e.g. an eval blend sharded
+    contiguously so rank0 is still in dataset A while rank7 has moved to dataset B) would
+    enter mismatched per-key collectives -> NCCL hang / cross-key corruption.
+    """
+    # Local per-key partial sums + their numel (1 or 2), computed without any collective.
+    local: dict[str, torch.Tensor] = {}
+    local_numel: dict[str, int] = {}
+    for key in set().union(*(chunk.keys() for chunk in metric_chunks)) if metric_chunks else set():
         vals = [chunk[key].view(-1) for chunk in metric_chunks if key in chunk]
         if not vals:
             continue
-        if vals[0].numel() == 2:
-            stacked = torch.vstack(vals).sum(dim=0)
-            if group is not None:
-                torch.distributed.all_reduce(stacked, group=group)
-            reduced[key] = stacked
-        elif vals[0].numel() == 1:
-            scalar = torch.cat(vals).sum()
-            if group is not None:
-                torch.distributed.all_reduce(scalar, group=group)
-            reduced[key] = scalar.view(1)
+        n = vals[0].numel()
+        if n == 2:
+            local[key] = torch.vstack(vals).sum(dim=0)
+        elif n == 1:
+            local[key] = torch.cat(vals).sum().view(1)
         else:
             raise ValueError(f"Invalid value shape: {vals[0].shape} for key {key}")
+        local_numel[key] = n
+
+    # Agree on the global key set + numel across ranks (no-op when not distributed).
+    if group is not None and torch.distributed.is_initialized():
+        gathered: list[dict[str, int] | None] = [None] * torch.distributed.get_world_size(group)
+        torch.distributed.all_gather_object(gathered, local_numel, group=group)
+        global_numel: dict[str, int] = {}
+        for d in gathered:
+            for k, n in (d or {}).items():
+                if k in global_numel and global_numel[k] != n:
+                    raise ValueError(f"inconsistent numel for key {k}: {global_numel[k]} vs {n}")
+                global_numel[k] = n
+    else:
+        global_numel = dict(local_numel)
+
+    # Reduce every global key in a deterministic order; missing keys contribute zeros.
+    reduced: dict[str, torch.Tensor] = {}
+    device = next(iter(local.values())).device if local else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for key in sorted(global_numel):
+        n = global_numel[key]
+        val = local.get(key)
+        if val is None:
+            val = torch.zeros(n, dtype=torch.float, device=device)
+        if group is not None and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(val, group=group)
+        reduced[key] = val
     return reduced
 
 
