@@ -348,14 +348,25 @@ def _looped_adapter_flops(cfg, seqlen_sum: int) -> int:
 
     The adapter mixes the recurrent state with the re-injected prelude output at
     the top of every iteration. ``injection="concat"`` is two h x h GEMMs per
-    iteration (mathematically one 2h -> h GEMM on the concatenation); "add" and
-    "none" are parameter-free and cost nothing measurable here.
+    iteration (mathematically one 2h -> h GEMM on the concatenation); "none" is
+    parameter-free and costs nothing measurable here.
+
+    The adapter is only built when *both* ``looped_state_noise_init`` and
+    ``looped_reinject_embed`` are on (see LoopedTransformerBlock); with either off
+    there is no mixer, so it contributes no FLOPs regardless of injection mode.
 
     Factor 3 covers forward + backward; factor 2 turns MACs into FLOPs.
     """
     if not getattr(cfg.model, "looped_enable", False):
         return 0
     if cfg.model.looped_input_injection != "concat":
+        return 0
+    # Mirror the block's adapter-active predicate (both default True): zeroes the
+    # term for the noise-off / reinject-off ablations that drop the adapter.
+    if not (
+        getattr(cfg.model, "looped_state_noise_init", True)
+        and getattr(cfg.model, "looped_reinject_embed", True)
+    ):
         return 0
     return 3 * 2 * seqlen_sum * 2 * cfg.model.hidden_size**2 * cfg.model.looped_num_recurrence
 
