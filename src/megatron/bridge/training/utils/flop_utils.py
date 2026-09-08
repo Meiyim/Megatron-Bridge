@@ -303,6 +303,63 @@ def vit_flops(
     return (transformer_flops_val + merger_flops_val) * batch_size * 3  # 3x for training (fwd + bwd)
 
 
+def _looped_unrolled_depth(cfg) -> int:
+    """Number of transformer layers actually *executed* per forward pass.
+
+    Equals ``cfg.model.num_layers`` for a normal model, and
+    ``l_P + r*l_R + l_C`` for a looped / recurrent-depth one.
+    """
+    if not getattr(cfg.model, "looped_enable", False):
+        return cfg.model.num_layers
+    l_p = cfg.model.looped_prelude_layers
+    l_c = cfg.model.looped_coda_layers
+    l_r = cfg.model.num_layers - l_p - l_c
+    return l_p + cfg.model.looped_num_recurrence * l_r + l_c
+
+
+def _expand_looped_layer_pattern(cfg, pattern: list[int]) -> list[int]:
+    """Unroll a per-layer pattern over the recurrence of a looped transformer.
+
+    A looped / recurrent-depth model (arXiv 2502.05171) executes its middle layer
+    range ``r`` times per forward pass, so its FLOP cost corresponds to the
+    *unrolled* depth ``l_P + r*l_R + l_C`` rather than ``num_layers``. Every
+    per-layer cost in this module is driven off a length-``num_layers`` pattern,
+    so expanding the pattern here makes all downstream terms correct without
+    touching the formulas.
+
+    Returns the pattern unchanged when the model is not looped.
+
+    ``pattern`` may carry trailing MTP entries beyond ``num_layers``; only the
+    transformer-stack prefix is unrolled and the tail is preserved.
+    """
+    if not getattr(cfg.model, "looped_enable", False):
+        return pattern
+
+    l_p = cfg.model.looped_prelude_layers
+    l_c = cfg.model.looped_coda_layers
+    r = cfg.model.looped_num_recurrence
+    stack, tail = pattern[: cfg.model.num_layers], pattern[cfg.model.num_layers :]
+    core_end = len(stack) - l_c
+    return stack[:l_p] + stack[l_p:core_end] * r + stack[core_end:] + tail
+
+
+def _looped_adapter_flops(cfg, seqlen_sum: int) -> int:
+    """FLOPs contributed by the looped adapter across all r iterations.
+
+    The adapter mixes the recurrent state with the re-injected prelude output at
+    the top of every iteration. ``injection="concat"`` is two h x h GEMMs per
+    iteration (mathematically one 2h -> h GEMM on the concatenation); "add" and
+    "none" are parameter-free and cost nothing measurable here.
+
+    Factor 3 covers forward + backward; factor 2 turns MACs into FLOPs.
+    """
+    if not getattr(cfg.model, "looped_enable", False):
+        return 0
+    if cfg.model.looped_input_injection != "concat":
+        return 0
+    return 3 * 2 * seqlen_sum * 2 * cfg.model.hidden_size**2 * cfg.model.looped_num_recurrence
+
+
 def num_floating_point_operations(
     cfg: ConfigContainer,
     batch_size: int = 1,
@@ -673,8 +730,9 @@ def num_floating_point_operations(
             return batch_size * (model_flops_frozen * (2.0 / 3.0) + model_flops_unfrozen)
         # MoE.
         if cfg.model.num_moe_experts is None:
-            # Every Transformer MLP is dense.
-            num_dense_layers = cfg.model.num_layers
+            # Every Transformer MLP is dense. A looped model executes its middle
+            # range r times, so the *unrolled* depth drives the cost.
+            num_dense_layers = _looped_unrolled_depth(cfg)
             num_moe_layers = 0
             num_experts_routed_to = 0
             last_layer_is_moe = 0
@@ -692,8 +750,11 @@ def num_floating_point_operations(
                 f"expected {cfg.model.num_layers}, "
                 f"current moe layer pattern: {moe_layer_freq}"
             )
+            # Unroll the recurrence *after* validating the declared pattern, so a
+            # looped model's dense/MoE split reflects the layers actually executed.
+            moe_layer_pattern = _expand_looped_layer_pattern(cfg, moe_layer_pattern)
             num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
-            num_dense_layers = cfg.model.num_layers - num_moe_layers
+            num_dense_layers = len(moe_layer_pattern) - num_moe_layers
             num_experts_routed_to = getattr(cfg.model, "moe_router_topk", 1)
             last_layer_is_moe = moe_layer_pattern[-1]
 
@@ -701,10 +762,10 @@ def num_floating_point_operations(
             mtp_num_layers = cfg.model.mtp_num_layers
             num_moe_layers += last_layer_is_moe * mtp_num_layers
             num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
-            num_layers = cfg.model.num_layers + mtp_num_layers
+            num_layers = _looped_unrolled_depth(cfg) + mtp_num_layers
         else:
             mtp_num_layers = 0
-            num_layers = cfg.model.num_layers
+            num_layers = _looped_unrolled_depth(cfg)
 
         # 'moe_ffn_hidden_size' is set only for MoE models.
         moe_ffn_hidden_size = (
@@ -911,7 +972,10 @@ def num_floating_point_operations(
                     num_swa_layers = sum(swa_pattern)
                     num_full_attn_layers = num_layers - num_swa_layers
                 elif isinstance(window_attn_skip_freq, list):
-                    swa_pattern = window_attn_skip_freq[:num_layers]
+                    # Unroll the recurrence so a looped model's SWA/full split
+                    # reflects the layers actually executed (the declared list is
+                    # num_layers long; num_layers here is the unrolled depth).
+                    swa_pattern = _expand_looped_layer_pattern(cfg, list(window_attn_skip_freq))[:num_layers]
                     num_swa_layers = sum(swa_pattern)
                     num_full_attn_layers = num_layers - num_swa_layers
                 else:
@@ -949,13 +1013,17 @@ def num_floating_point_operations(
                     0 if ((i + 1) % linear_attention_freq == 0) else 1 for i in range(num_layers)
                 ]
             elif isinstance(linear_attention_freq, list):
-                linear_attention_pattern = linear_attention_freq
-                if len(linear_attention_pattern) != num_layers:
+                # The declared pattern covers the *built* layers; num_layers is the
+                # unrolled depth, which differs only for a looped model.
+                declared_num_layers = cfg.model.num_layers + mtp_num_layers
+                if len(linear_attention_freq) != declared_num_layers:
                     raise ValueError(
-                        f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                        f"expected {num_layers}, "
+                        f"Invalid length of linear_attention_pattern: {len(linear_attention_freq)}, "
+                        f"expected {declared_num_layers}, "
                         f"current linear_attention_freq: {linear_attention_freq}"
                     )
+                # Unroll the recurrence for looped models; a no-op otherwise.
+                linear_attention_pattern = _expand_looped_layer_pattern(cfg, list(linear_attention_freq))
             else:
                 raise TypeError(
                     f"linear_attention_freq must be int or list, got {type(linear_attention_freq).__name__}"
@@ -1037,6 +1105,9 @@ def num_floating_point_operations(
             # Logit.
             + 3 * 2 * cfg.model.hidden_size * padded_vocab_size * (mtp_num_layers + 1)
         )
+        # Looped-transformer adapter: r extra (2h -> h) mixes, outside the
+        # per-layer terms above because it is a block-level module.
+        total_floating_point_operations += _looped_adapter_flops(cfg, seqlen_sum)
         return total_floating_point_operations + _compute_vit_flops()
 
     def _compute_vit_flops():
